@@ -1,176 +1,251 @@
-# arXiv Large-Scale PDF Linguistic & Reference Analyzer
+# arXiv Large-Scale PDF Stylometric & Reference Analysis Pipeline
 
-A memory-bounded Python pipeline for analyzing hundreds of thousands of arXiv research articles stored inside multi-terabyte `.tar.gz` archives **without extracting PDFs to disk**.
+A three-stage, memory-bounded Python pipeline for analyzing hundreds of thousands of arXiv research articles stored inside multi-terabyte `.tar.gz` archives—**without extracting PDFs to disk**.
 
-Built to run reliably over long multi-day sessions on modest hardware (such as a quad-core Intel i5-6500T with 8 GB RAM), with full SQLite checkpointing for stop/resume, rotating logs, live terminal progress, optional CrossRef/arXiv reference validation, and before/after trend plotting.
+Built to run reliably over multi-day sessions on modest hardware (such as a quad-core Intel i5-6500T with 8 GB RAM), with WAL-mode SQLite checkpointing for stop/resume, rotating logs, live terminal progress, decoupled API reference verification, and a full before/after longitudinal plotting suite.
 
 ---
 
-## Features
+## Architecture: Three Decoupled Passes
 
-- **Zero Disk Extraction:** Streams `.pdf` files directly from `.tar.gz` / `.tgz` archives using `tarfile` streaming mode (`r|gz`) straight into `PyMuPDF` in memory. Includes an isolated temp-directory safeguard that cleans itself up automatically on exit.
-- **Tuned for 4 Cores & 8 GB RAM:**
-  - Defaults to `--workers 3`, leaving 1 core free for gzip stream decompression, CSV flushing, and OS I/O.
-  - Strict backpressure queue (`2 × workers` PDFs in memory at once).
-  - Automatic worker recycling every 200 PDFs (`maxtasksperchild=200`) to prevent C-level memory leaks over 200,000+ documents.
-  - Configurable size cap (`--max-pdf-mb`), page cap (`--max-pages`), and per-PDF timeout (`--pdf-timeout`).
-- **Crash-Safe Stop & Resume:** Tracks completed archives and individual PDFs in a WAL-mode SQLite database (`arxiv_state.sqlite`) while appending to the output CSV in batches. Press `Ctrl+C` anytime to flush in-flight work cleanly, and re-run the same command to pick up right where you left off.
-- **Linguistic & Structural Metrics:** Separates main prose from the bibliography before computing:
-  - **FRE** (Flesch Reading Ease)
-  - **FKGL** (Flesch-Kincaid Grade Level)
-  - **MATTR-100** (Moving-Average Type-Token Ratio, 100-word sliding window in `O(N)` time)
-  - **Shannon Character Entropy** (bits/character)
-  - **Passive Voice Ratio** (fast regex + irregular participle lexicon detector)
-  - **Average Sentence Length**, word/sentence/page counts, and average syllables per word
-  - **Author Count** (PDF metadata first, falling back to page-1 header heuristics)
-- **Reference Extraction & Validation:**
-  - **Offline (always on):** Counts extracted references, DOIs, and arXiv citations, and flags structural anomalies (impossible future publication years, malformed DOI strings).
-  - **Live API (`--validate-refs`):** Deterministically samples citations per paper and verifies them against CrossRef (by DOI or bibliographic query) and the arXiv API, backed by a persistent SQLite cache (`ref_validation_cache.sqlite`) so citations shared across papers are only queried once.
-- **Before/After Trend Plotting:** Reads the output CSV in memory-safe chunks and outputs a combined dashboard PNG, individual high-res metric PNGs with 95% confidence bands, a time-series CSV, and a before/after summary table for any cutoff date.
+Separating local PDF parsing from network-bound reference lookups ensures Pass 1 runs at full CPU/disk speed (never stalling on CrossRef/arXiv rate limits), while Pass 2 can be sampled, resumed, or re-run without ever decompressing the `.tar.gz` archives again.
+
+```text
+  [.tar.gz archives]
+          │
+          ▼  Pass 1: arxiv_analyzer.py (100% offline, CPU-bound)
+   ├── arxiv_metrics.csv        (75+ stylometric, structural, confounder & offline ref columns)
+   └── arxiv_references.jsonl.gz (crash-safe compressed dump of DOIs, arXiv IDs & ref entries)
+          │
+          ▼  Pass 2: validate_references.py (network-bound, cached, stop/resume)
+   ├── ref_validation.csv       (paper-level validity/error rates & match scores)
+   └── ref_audit.jsonl.gz       (optional per-citation outcomes for manual audit)
+          │
+          ▼  Pass 3: plot_trends.py (joins Pass 1 + Pass 2, or runs on either alone)
+   └── plots/                   (15 longitudinal figures + before_after_stats.csv + summary)
+```
 
 ---
 
 ## Requirements
 
 - Python 3.9+
-- Dependencies:
+- Install dependencies:
 
 ```bash
-pip install pymupdf tqdm requests pandas matplotlib psutil
+# Pass 1 (PDF streaming & stylometry)
+pip install pymupdf tqdm psutil
+
+# Pass 2 (Live CrossRef / OpenAlex / arXiv validation)
+pip install requests tqdm psutil
+
+# Pass 3 (Graphs & statistical tests)
+pip install pandas numpy matplotlib scipy
 ```
 
-> **Notes:**
-> - `pymupdf` (`fitz`) is required for PDF parsing.
-> - `tqdm` and `psutil` are optional but strongly recommended for the live progress bar and RAM monitor.
-> - `requests` is only required when using `--validate-refs`.
-> - `pandas` and `matplotlib` are only required when using `--plot` or `--plot-only`.
+Or install everything at once:
+
+```bash
+pip install pymupdf tqdm psutil requests pandas numpy matplotlib scipy
+```
 
 ---
 
 ## Quick Start
 
-### 1. Fast Offline Run (Recommended First Pass)
-
-Process all `.tar.gz` / `.tgz` files recursively inside a directory:
-
-```bash
-python arxiv_analyzer.py \
-  --input-dir /mnt/arxiv_tars \
-  --output arxiv_metrics.csv
-```
-
-Stop at any time with `Ctrl+C`. Wait a few seconds for in-flight PDFs to flush, then run the exact same command later to resume. Finished archives are skipped instantly without being re-decompressed.
-
-### 2. Run With Live Reference Validation
-
-Check a sample of references per paper against CrossRef and the arXiv API (provide `--mailto` to use CrossRef's faster polite pool):
+### Pass 1 — Stream PDFs, Compute All Metrics & Dump References (Offline)
 
 ```bash
 python arxiv_analyzer.py \
   --input-dir /mnt/arxiv_tars \
   --output arxiv_metrics.csv \
-  --validate-refs \
-  --ref-sample 5 \
-  --mailto you@university.edu
+  --refs-output arxiv_references.jsonl.gz \
+  --workers 3
 ```
 
-> **Throughput tip:** Because live API checks are network-bound, validating 5 references across 200,000 papers will take much longer than a pure local pass—even with the SQLite cache deduplicating popular papers. Test on a small folder of 1–2 archives first to gauge your preferred `--ref-sample` size.
+- Press `Ctrl+C` anytime to flush in-flight batches cleanly; re-run the exact same command later to resume. Finished archives are skipped immediately without re-decompressing.
+- Each flush appends an independent gzip frame to `arxiv_references.jsonl.gz`, so a sudden power loss cannot corrupt previously flushed papers.
 
-### 3. Generate Before / After Trend Plots
+### Pass 2 — Validate Extracted References (Live APIs + Persistent SQLite Cache)
 
-Run plotting at any time, even on a partially completed CSV while collecting data, without re-reading any archives:
+For a **fast stratified pilot curve** (e.g., up to 200 papers per month across the full timeline):
 
 ```bash
-python arxiv_analyzer.py \
-  --plot-only \
-  --output arxiv_metrics.csv \
-  --plots-dir ./plots \
+python validate_references.py \
+  --input arxiv_references.jsonl.gz \
+  --output ref_validation.csv \
+  --audit-output ref_audit.jsonl.gz \
+  --per-month-cap 200 \
+  --max-dois 10 \
+  --max-arxiv 10 \
+  --max-entries 5 \
+  --email you@university.edu
+```
+
+For a **full validation run** (remove `--per-month-cap`; adjust `--mode` to `identifiers-only` for much faster DOI + arXiv checks without free-text CrossRef queries):
+
+```bash
+python validate_references.py \
+  --input arxiv_references.jsonl.gz \
+  --output ref_validation.csv \
+  --email you@university.edu
+```
+
+- Providing `--email` places requests in the CrossRef and OpenAlex polite pools (faster and more reliable).
+- Verified citations are cached permanently in `ref_api_cache.sqlite` so popular papers cited thousands of times are only queried once.
+- Stop with `Ctrl+C` and re-run the exact same command to resume; deterministic hash sampling guarantees identical paper selection across restarts.
+
+### Pass 3 — Generate All Graphs & Before/After Statistics
+
+Run with both Pass 1 and Pass 2 outputs (or supply only `--metrics-csv` or only `--refs-csv` while the other pass is still running):
+
+```bash
+python plot_trends.py \
+  --metrics-csv arxiv_metrics.csv \
+  --refs-csv ref_validation.csv \
   --cutoff-date 2022-11 \
-  --plot-freq M
+  --output-dir plots \
+  --freq M \
+  --rolling 3
 ```
 
-This creates inside `./plots/`:
-- `trends_dashboard.png` — multi-panel overview of all metrics over time with 95% confidence intervals and a vertical cutoff line
-- `trend_<metric>.png` — individual high-resolution plots for each metric
-- `trends_timeseries.csv` — aggregated monthly/quarterly/yearly means and paper counts
-- `before_after_summary.csv` — before vs. after sample sizes, means, standard deviations, and deltas
+Optional quality/discipline filtering:
+
+```bash
+python plot_trends.py \
+  --metrics-csv arxiv_metrics.csv \
+  --refs-csv ref_validation.csv \
+  --cutoff-date 2022-11 \
+  --start-date 2018-01 \
+  --min-alpha-ratio 0.55 \
+  --groups cs,stat,math,physics \
+  --output-dir plots_clean
+```
 
 ---
 
-## CLI Reference
+## What Pass 1 Computes (`arxiv_metrics.csv`)
 
+Every PDF produces one row (including skipped/encrypted/errored files, distinguished via `status`):
+
+- **Identification & Confounders:** `archive_name`, `member_name`, `arxiv_id`, `arxiv_version`, `arxiv_category`, `arxiv_primary_group` (parsed from page-1 arXiv stamp), `pub_date`, `exact_pub_date`, `pub_year`, `pub_month`, `pdf_creator`, `pdf_producer`.
+- **Volume & Extraction-Noise Controls:** `page_count`, `char_count`, `word_count`, `sentence_count`, `alpha_char_ratio`, `digit_char_ratio`, `symbol_char_ratio`, `non_ascii_ratio`, `single_char_token_ratio` (lets you filter math-heavy or poor-OCR PDFs cleanly).
+- **Readability & Sentence Burstiness:** `fre`, `fkgl`, `cli` (Coleman-Liau), `fog` (Gunning Fog), `avg_sentence_length`, `sentence_length_std`, `sentence_length_median`, `sentence_length_iqr`, `avg_word_length`, `avg_syllables_per_word`, `complex_word_ratio`.
+- **Lexical Diversity & Entropy:** `mattr_100` (100-word sliding window in `O(N)` time), `yules_k`, `hapax_ratio`, `shannon_char_entropy`, `shannon_word_entropy`.
+- **Voice, Stance, Punctuation & Marker Lexicons (per 1,000 words):** `passive_sentence_count`, `passive_voice_ratio`, `first_person_plural_per_1k`, `first_person_singular_per_1k`, `hedging_per_1k`, `booster_per_1k`, `dash_per_1k`, `semicolon_per_1k`, `colon_per_1k`, `paren_per_1k`, `llm_excess_words_per_1k` (transparent fixed lexicon), `control_words_per_1k` (neutral academic baseline).
+- **Abstract-Only Parallel Control:** `abstract_word_count`, `abstract_sentence_count`, `abstract_avg_sentence_length`, `abstract_fre`, `abstract_fkgl`, `abstract_mattr_100`, `abstract_passive_ratio` (clean prose unaffected by equations/tables).
+- **Authorship & Structure:** `author_count`, `author_source`, `has_code_url`, `code_url_count`, `has_appendix`, `has_acknowledgments`, `has_limitations_or_ethics`, `figure_mention_count`, `table_mention_count`.
+- **Offline Reference Stats & Recency:** `ref_count`, `doi_count`, `arxiv_ref_count`, `ref_future_year_flags`, `ref_malformed_doi_flags`, `ref_min_year`, `ref_median_year`, `ref_max_year`, `ref_mean_age`.
+
+---
+
+## What Pass 2 Validates (`ref_validation.csv`)
+
+Reads `arxiv_references.jsonl.gz` line-by-line and checks three citation layers against live registries:
+
+1. **DOIs** → CrossRef REST API with automatic OpenAlex fallback (catches DataCite, Zenodo, and arXiv DOIs absent from CrossRef).
+2. **arXiv IDs** → Batched arXiv Atom API queries (respecting the ≥3 s arXiv rate limit).
+3. **Free-text reference entries** → CrossRef bibliographic search scored deterministically on `[0, 1]` using title token overlap (`0.65`), author surname match (`0.20`), and publication year match (`0.15`, ±1 year tolerance).
+
+Outputs per-paper checked/valid/invalid/error counts for each layer plus `ref_validity_rate`, `ref_invalid_rate`, `has_any_invalid_ref`, `has_multiple_invalid_refs`, and `mean_match_score`.
+
+---
+
+## What Pass 3 Generates (`plots/`)
+
+### Figures (up to 15 publication-ready PNG/PDF/SVG files)
+1. `01_overview_dashboard` — 6-panel executive summary (FRE, MATTR-100, char entropy, passive voice, excess words, live ref validity)
+2. `02_readability_trends` — FRE, FKGL, Coleman-Liau, Gunning Fog
+3. `03_lexical_diversity_and_entropy` — MATTR-100, Yule's K, hapax ratio, char/word entropy, word length
+4. `04_sentence_structure_and_burstiness` — sentence length mean, std dev, IQR, complex word ratio
+5. `05_voice_stance_and_punctuation` — passive voice, 1st-person plural, hedging, boosters, dashes, semicolons
+6. `06_llm_excess_vs_control_words` — raw + indexed (`Pre = 100`) comparison of LLM excess vs neutral academic control words
+7. `07_body_vs_abstract_control` — body vs abstract-only parallel overlay
+8. `08_authorship_and_structure` — author count, pages, word count, code URL share, appendix, limitations/ethics
+9. `09_confounders_and_discipline_mix` — monthly volume, stacked discipline share, alphabetic ratio, single-char token ratio
+10. `10_discipline_stratified_trends` — top-5 arXiv disciplines across 4 core metrics
+11. `11_offline_references_and_recency` — reference count, mean age, DOI/arXiv counts, future-year & malformed-DOI flags
+12. `12_live_reference_validation` — overall, DOI, arXiv, and free-text verification rates + paper-level invalid-ref prevalence
+13. `13_ref_validation_by_discipline` — Pass 2 validity rates stratified by discipline
+14. `14_stylometry_vs_ref_validity` — binned excess-word density vs ref invalidity (pre/post) + Spearman correlation chart
+15. `15_before_after_effect_sizes` — Cohen's d forest plot with 95% confidence intervals across all key metrics
+
+### Data & Statistical Summaries
+- `before_after_stats.csv` — pre/post means, medians, SDs, % change, Welch's t-test, Mann-Whitney U, Cohen's d (±95% CI), and pre/post annual trend slopes
+- `timeseries_aggregated.csv` — monthly/quarterly counts, means, SDs, 95% CIs, medians, and IQRs for every metric
+- `summary_report.txt` — terminal-printed overview of sample sizes and top 15 shifts by |d|
+
+---
+
+## Key CLI Reference
+
+### `arxiv_analyzer.py` (Pass 1)
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--input-dir` | *(required unless `--plot-only`)* | Root directory searched recursively for `.tar.gz` and `.tgz` files |
-| `--output` | `arxiv_metrics.csv` | Output CSV path (safely appended across sessions) |
-| `--state-db` | `arxiv_state.sqlite` | SQLite checkpoint DB for completed archives and processed PDFs |
-| `--log-file` | `arxiv_analyzer.log` | Rotating log file (20 MB per file, up to 5 backups) |
-| `--temp-dir` | OS default | Optional base directory for isolated session temp safeguard |
-| `--workers` | `3` | Number of worker processes (3 is optimal for a 4-core CPU) |
+| `--input-dir` | *(required)* | Root directory searched recursively for `.tar.gz` / `.tgz` files |
+| `--output` | `arxiv_metrics.csv` | Output CSV path (append-safe across resumes) |
+| `--refs-output` | `arxiv_references.jsonl.gz` | Compressed JSONL dump of extracted references for Pass 2 |
+| `--dump-max-refs` | `25` | Max evenly spaced reference strings saved per paper (`0` = all) |
+| `--no-refs-dump` | `False` | Skip writing `.jsonl.gz` (still records offline ref metrics in CSV) |
+| `--state-db` | `arxiv_state.sqlite` | SQLite checkpoint DB for completed archives and PDFs |
+| `--workers` | `3` | Worker processes (3 leaves 1 core for gzip I/O on a quad-core CPU) |
 | `--max-pdf-mb` | `50.0` | Skip individual PDFs larger than this threshold (MB) |
-| `--max-pages` | `150` | Max pages parsed per PDF (always reads final 5 pages for references if truncated) |
-| `--pdf-timeout` | `45.0` | Timeout in seconds per PDF before marking as `timeout` and continuing |
-| `--validate-refs` | `False` | Enable live CrossRef / arXiv API reference verification |
-| `--ref-cache-db` | `ref_validation_cache.sqlite` | Persistent SQLite cache for verified/unverified citations |
-| `--ref-sample` | `5` | Max evenly-spaced references checked per paper |
-| `--ref-timeout` | `6.0` | HTTP request timeout per reference lookup (seconds) |
-| `--ref-delay` | `0.08` | Minimum delay between API requests per worker (seconds) |
-| `--mailto` | `""` | Contact email sent to CrossRef polite pool |
-| `--plot` | `False` | Automatically generate trend plots when processing finishes |
-| `--plot-only` | `False` | Skip PDF processing and plot directly from `--output` |
-| `--plots-dir` | `plots` | Directory for generated PNGs and summary CSVs |
-| `--cutoff-date` | `None` | Optional `YYYY-MM` cutoff date for before/after comparison |
-| `--plot-freq` | `M` | Aggregation frequency: `M` (monthly), `Q` (quarterly), `Y` (yearly) |
-| `-v`, `--verbose` | `False` | Also print `INFO` logs to stderr |
+| `--max-pages` | `150` | Max pages parsed per PDF (always reads final 5 pages for references) |
+| `--pdf-timeout` | `45.0` | Per-PDF timeout in seconds |
+
+### `validate_references.py` (Pass 2)
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--input` | `arxiv_references.jsonl.gz` | Pass 1 reference dump `.jsonl.gz` |
+| `--output` | `ref_validation.csv` | Output paper-level validation CSV |
+| `--audit-output` | `""` | Optional `.jsonl.gz` storing per-reference check details for manual review |
+| `--state-db` | `ref_validation_state.sqlite` | SQLite checkpoint DB for stop/resume |
+| `--cache-db` | `ref_api_cache.sqlite` | Persistent citation cache shared across runs |
+| `--mode` | `all` | `all`, `identifiers-only`, or `entries-only` |
+| `--max-dois` / `--max-arxiv` / `--max-entries` | `10` / `10` / `5` | Per-paper verification caps (`0` = unlimited for DOIs/arXiv, skip for entries) |
+| `--match-threshold` | `0.62` | Minimum bibliographic similarity score `[0–1]` for free-text match |
+| `--per-month-cap` | `0` | Cap validated papers per `YYYY-MM` month (`0` = unlimited) |
+| `--sample-rate` | `1.0` | Deterministic hash-sampled fraction of papers `(0.0–1.0]` |
+| `--year-min` / `--year-max` / `--category-group` | `None` | Optional subset filters |
+| `--email` | `""` | Contact email for CrossRef / OpenAlex polite pool |
+
+### `plot_trends.py` (Pass 3)
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--metrics-csv` | `None` | Pass 1 CSV (`arxiv_metrics.csv`) |
+| `--refs-csv` | `None` | Pass 2 CSV (`ref_validation.csv`) |
+| `--output-dir` | `plots` | Output directory for figures and CSV summaries |
+| `--cutoff-date` | `2022-11` | Before/after cutoff month (`YYYY-MM`) |
+| `--start-date` / `--end-date` | `None` | Optional date window bounds (`YYYY-MM`) |
+| `--freq` | `MS` | Binning frequency: `M`/`MS` (monthly) or `Q`/`QS` (quarterly) |
+| `--rolling` | `3` | Centered rolling window in bins (`1` = raw) |
+| `--min-per-bin` | `10` | Minimum papers required to plot a time bin |
+| `--groups` | `None` | Comma-separated arXiv groups (e.g., `cs,math,physics,stat`) |
+| `--min-words` / `--min-alpha-ratio` | `300` / `0.0` | Pass 1 quality filters |
+| `--format` / `--dpi` | `png` / `180` | Output format (`png`, `pdf`, `svg`) and DPI |
 
 ---
 
-## Output CSV Schema
+## Running Multi-Day Jobs Safely
 
-Every PDF encountered produces one row in `--output` (including skipped, encrypted, scanned, or errored files, distinguished via the `status` column):
-
-| Column | Description |
-| :--- | :--- |
-| `archive_name`, `member_name` | Source `.tar.gz` filename and internal member path |
-| `arxiv_id` | Canonical arXiv identifier parsed from the filename |
-| `pub_date`, `pub_year`, `pub_month` | Derived `YYYY-MM` date, integer year, and integer month |
-| `status` | `ok`, `no_text`, `encrypted`, `empty`, `skipped_too_large`, `timeout`, `stream_error`, or `error` |
-| `page_count`, `char_count`, `word_count`, `sentence_count` | Basic document volume statistics (computed on body prose) |
-| `avg_sentence_length`, `avg_syllables_per_word` | Core readability inputs |
-| `fre`, `fkgl` | Flesch Reading Ease and Flesch-Kincaid Grade Level |
-| `mattr_100` | Moving-Average Type-Token Ratio (100-word window) |
-| `shannon_char_entropy` | Shannon character entropy in bits per character |
-| `passive_sentence_count`, `passive_voice_ratio` | Count and fraction of body sentences with passive constructions |
-| `author_count`, `author_source` | Estimated author count and source (`pdf_metadata`, `page1_heuristic`, or `unknown`) |
-| `ref_count`, `doi_count`, `arxiv_ref_count` | Parsed bibliography entries, unique DOIs, and unique arXiv citations |
-| `ref_future_year_flags`, `ref_malformed_doi_flags` | Offline structural red-flag counts |
-| `refs_checked`, `refs_verified`, `refs_unverified`, `ref_verification_rate` | Live API validation results (populated when `--validate-refs` is enabled) |
-| `error_message` | Diagnostic message if `status != "ok"` |
-
----
-
-## Methodological Notes & Limitations
-
-- **Passive Voice Detection:** Uses a regex + irregular past-participle lexicon with common participial adjective exclusions rather than full neural dependency parsing (e.g., spaCy). This keeps RAM usage tiny and speed ~50× faster across 200k+ papers, with consistent bias across before/after cohorts.
-- **Author Counts:** PDF metadata is sometimes blank or unformatted on older LaTeX submissions; the page-1 heuristic provides a fallback, and `author_source` lets you filter or validate against the official arXiv metadata dataset if desired.
-- **Reference Validation:** An `unverified` citation does not automatically prove hallucination—books, technical reports, non-DOI conference papers, OCR glitches, or unusual citation formats can fail automated CrossRef lookups. Treat `ref_verification_rate` alongside `ref_future_year_flags` and `ref_malformed_doi_flags` as comparative signals across time periods, and inspect flagged outliers manually.
-- **Duplicate Rows on Hard Power Loss:** Normal `Ctrl+C` stops flush SQLite and CSV together. If the machine loses power mid-batch (at most 50 rows), a resumed run could re-append up to 50 rows; deduplicating on `(archive_name, member_name)` before final statistical modeling is good practice.
-
----
-
-## Running Overnight / Long Sessions
-
-For multi-day runs on Linux/macOS, run inside `tmux` or `screen` so terminal disconnects do not interrupt the job:
+Run long Pass 1 or Pass 2 sessions inside `tmux` or `screen` so SSH/terminal disconnects never interrupt progress:
 
 ```bash
 tmux new -s arxiv
 python arxiv_analyzer.py --input-dir /mnt/arxiv_tars --output arxiv_metrics.csv
-# Detach with Ctrl+B, then D
-# Reattach anytime with: tmux attach -t arxiv
+# Detach: Ctrl+B then D  |  Reattach: tmux attach -t arxiv
 ```
 
-Monitor detailed progress or errors in another terminal with:
+Monitor logs in another pane:
 
 ```bash
 tail -f arxiv_analyzer.log
 ```
+
+---
+
+## Methodological Notes
+
+- **Confounder Control:** Overall arXiv trends can shift simply because computer science (`cs`) grows as a share of submissions. Use `09_confounders_and_discipline_mix`, `10_discipline_stratified_trends`, and `--groups` / `--min-alpha-ratio` in Pass 3 to separate genuine writing shifts from field-mix or OCR artifacts.
+- **Unverified ≠ Proven Hallucination:** Books, workshops, technical reports, non-DOI venues, or PDF line-wrap artifacts can fail automated lookups. Use `ref_validity_rate` comparatively across time cohorts alongside `--audit-output` to inspect flagged citations manually.
+- **Hard Power Loss Deduplication:** Normal `Ctrl+C` exits flush SQLite and CSV together. On an abrupt power cut, at most one batch (≤50 rows) could be re-appended upon resume; `plot_trends.py` automatically deduplicates on `(archive_name, member_name)`.
